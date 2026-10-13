@@ -1,7 +1,11 @@
 """
 ICMR + HITEK Search API
+========================
 DuckDB-backed search over 2.5B records.
-Author : @Cosmos_ownerr | Channel: @cosmosxinfo
+Reads remote Parquet indexes from Hugging Face bucket.
+
+Author : @Cosmos_ownerr
+Channel: @cosmosxinfo
 """
 
 import asyncio
@@ -19,15 +23,18 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
-# ── CONFIG ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
+
 HF_INDEX_BASE = os.environ.get(
     "ICMR_HF_INDEX_BASE",
-    "https://huggingface.co/buckets/Apimaking/icrm-hitek-full-db-5-billon-rows/resolve",
+    "https://huggingface.co/buckets/Apimaking/icrm-hitek-full-db-mixed-bucket-new/resolve",
 ).rstrip("/")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
-THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "8"))
+THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 RATE_LIMIT_PER_MIN = int(os.environ.get("ICMR_RATE_LIMIT", "20"))
 
@@ -45,19 +52,15 @@ REMOTE_INDEXES = {
     "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
 }
 
+# Writable dirs on Render
+DUCKDB_HOME = "/tmp/duckdb_home"
+DUCKDB_EXT  = "/tmp/duckdb_ext"
+os.makedirs(DUCKDB_HOME, exist_ok=True)
+os.makedirs(DUCKDB_EXT, exist_ok=True)
+
 
 def _credit_block() -> dict:
     return {"developer": DEVELOPER, "channel": CHANNEL}
-
-
-def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "").strip()
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    real_ip = request.headers.get("X-Real-IP", "").strip()
-    if real_ip:
-        return real_ip
-    return request.client.host if request.client else "unknown"
 
 
 # ── Cache ───────────────────────────────────────────────────────────────────
@@ -94,10 +97,14 @@ def _rate_ok(ip: str) -> bool:
         return True
 
 
-# ── DuckDB persistent connection ────────────────────────────────────────────
-_main_conn: duckdb.DuckDBPyConnection | None = None
-_main_lock = threading.Lock()
+# ── DuckDB pool ─────────────────────────────────────────────────────────────
+_conns: list[duckdb.DuckDBPyConnection] = []
+_conns_lock = threading.Lock()
+_thread_local = threading.local()
 pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
+
+_ext_ready = False
+_ext_lock = threading.Lock()
 
 
 def _idx_ready(kind: str) -> bool:
@@ -105,65 +112,97 @@ def _idx_ready(kind: str) -> bool:
 
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
+    """
+    Create a DuckDB connection with httpfs + parquet loaded and
+    remote Parquet views registered.
+    """
+    global _ext_ready
+
     con = duckdb.connect()
-    con.execute("SET home_directory='/opt/Render/.duckdb_cache'")
-    con.execute("SET extension_directory='/opt/Render/.duckdb_cache/ext'")
+    con.execute(f"SET home_directory='{DUCKDB_HOME}'")
+    con.execute(f"SET extension_directory='{DUCKDB_EXT}'")
+
+    # Install + load extensions ONCE per process, guarded by lock
+    with _ext_lock:
+        if not _ext_ready:
+            try:
+                print("[duckdb] INSTALL parquet …")
+                con.execute("INSTALL parquet;")
+                con.execute("LOAD parquet;")
+                print("[duckdb] INSTALL httpfs …")
+                con.execute("INSTALL httpfs;")
+                con.execute("LOAD httpfs;")
+                _ext_ready = True
+                print("[duckdb] extensions ready ✅")
+            except Exception as e:
+                print(f"[duckdb][FATAL] extension install failed: {e}")
+                # Try to load pre-bundled extension as fallback
+                try:
+                    con.execute("LOAD parquet;")
+                    con.execute("LOAD httpfs;")
+                    _ext_ready = True
+                    print("[duckdb] fallback LOAD succeeded ✅")
+                except Exception as e2:
+                    print(f"[duckdb][FATAL] fallback LOAD failed: {e2}")
+                    raise
+        else:
+            # Another thread already installed — just load
+            try:
+                con.execute("LOAD parquet;")
+                con.execute("LOAD httpfs;")
+            except Exception as e:
+                print(f"[duckdb][WARN] LOAD after ready failed: {e}")
+
+    # Performance knobs
     try:
-        con.execute("INSTALL parquet; LOAD parquet;")
-        con.execute("INSTALL httpfs;  LOAD httpfs;")
-    except Exception:
-        con.execute("LOAD parquet;")
-        con.execute("LOAD httpfs;")
+        con.execute("SET enable_http_metadata_cache=true")
+        con.execute("SET enable_object_cache=true")
+        con.execute("SET prefetch_all_parquet_files=true")
+    except Exception as e:
+        print(f"[duckdb][WARN] perf knobs: {e}")
 
-    con.execute("SET enable_http_metadata_cache=true")
-    con.execute("SET enable_object_cache=true")
-    con.execute("SET prefetch_all_parquet_files=true")
-    con.execute("SET http_keep_alive=true")
-    con.execute("SET http_timeout=300000")
-    con.execute("SET http_retries=5")
-    con.execute("SET threads=8")
-    con.execute("SET memory_limit='4GB'")
-
+    # HF token (in-memory secret, no file persistence)
     if HF_TOKEN:
         try:
             con.execute(
                 f"CREATE OR REPLACE SECRET hf_secret "
                 f"(TYPE huggingface, PROVIDER config, TOKEN '{HF_TOKEN}')"
             )
+            print("[duckdb] HF secret created ✅")
         except Exception as e:
-            print(f"[HF token secret failed] {e}")
+            print(f"[duckdb][WARN] HF secret failed: {e}")
 
+    # Register remote Parquet views
     for kind, urls in REMOTE_INDEXES.items():
         lst = ", ".join(f"'{u}'" for u in urls)
-        con.execute(
-            f"CREATE OR REPLACE VIEW people_{kind} AS "
-            f"SELECT * FROM read_parquet([{lst}])"
-        )
+        try:
+            con.execute(
+                f"CREATE OR REPLACE VIEW people_{kind} AS "
+                f"SELECT * FROM read_parquet([{lst}])"
+            )
+            print(f"[duckdb] view people_{kind} registered ✅")
+        except Exception as e:
+            print(f"[duckdb][ERROR] view people_{kind}: {e}")
+
+    con.execute(f"SET threads = {THREADS_PER_CONN}")
     return con
 
 
-def _get_main_conn() -> duckdb.DuckDBPyConnection:
-    global _main_conn
-    if _main_conn is None:
-        with _main_lock:
-            if _main_conn is None:
-                _main_conn = _new_conn()
-                print("[main_conn] persistent connection created")
-    return _main_conn
+def _thread_id() -> int:
+    tid = getattr(_thread_local, "id", None)
+    if tid is None:
+        with _conns_lock:
+            tid = len(_conns)
+            _thread_local.id = tid
+    return tid
 
 
-# ── Warmup ──────────────────────────────────────────────────────────────────
-def _warmup():
-    """Pre-load Parquet metadata into the persistent connection."""
-    try:
-        con = _get_main_conn()
-        print("[warmup] loading phone index...")
-        con.execute("SELECT COUNT(*) FROM people_phone LIMIT 1").fetchone()
-        print("[warmup] loading aadhar index...")
-        con.execute("SELECT COUNT(*) FROM people_aadhar LIMIT 1").fetchone()
-        print("[warmup] ✅ DuckDB ready — metadata cached in RAM")
-    except Exception as e:
-        print(f"[warmup error] {e}")
+def _get_conn() -> duckdb.DuckDBPyConnection:
+    ident = _thread_id()
+    with _conns_lock:
+        while len(_conns) <= ident:
+            _conns.append(_new_conn())
+    return _conns[ident]
 
 
 # ── Dedup + Final format ────────────────────────────────────────────────────
@@ -225,13 +264,25 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         if field != "name":
             return {"results": []}
         v2 = v.replace("%", r"\%").replace("_", r"\_")
-        sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
+        sql = (
+            f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' "
+            f"ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
+        )
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    con = _get_main_conn()
-    rows = con.execute(sql).fetchall()
-    cols = [d[0] for d in con.description]
+    con = _get_conn()
+    try:
+        rows = con.execute(sql).fetchall()
+        cols = [d[0] for d in con.description]
+    except Exception as e:
+        print(f"[QUERY ERROR] field={field} mode={mode} value={value}: {e}")
+        return {"results": [], "error": str(e)}
+
+    print(f"[COLS] {cols}")
+    if rows:
+        print(f"[ROW]  {rows[0]}")
+
     raw = [dict(zip(cols, r)) for r in rows]
     return {"results": raw}
 
@@ -298,7 +349,6 @@ def health():
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
         "cache_size": len(_cache),
         "hf_token": bool(HF_TOKEN),
-        "warmup_done": _main_conn is not None,
         **_credit_block(),
     }
 
@@ -315,7 +365,7 @@ async def search(
 ):
     t_start = time()
 
-    ip = _client_ip(request)
+    ip = request.client.host if request.client else "unknown"
     if not _rate_ok(ip):
         raise HTTPException(429, f"Rate limit: {RATE_LIMIT_PER_MIN} requests/minute per IP")
 
@@ -350,6 +400,8 @@ async def search(
             "results": [],
             **_credit_block(),
         }
+        if "error" in data:
+            result["debug_error"] = data["error"]
 
     content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
     return Response(content=content, media_type="application/json")
@@ -358,7 +410,7 @@ async def search(
 @fastapi_app.post("/search/parallel")
 async def search_parallel(request: Request, req: BatchRequest):
     t_start = time()
-    ip = _client_ip(request)
+    ip = request.client.host if request.client else "unknown"
     if not _rate_ok(ip):
         raise HTTPException(429, f"Rate limit: {RATE_LIMIT_PER_MIN} requests/minute per IP")
     if not req.queries:
@@ -418,15 +470,21 @@ async def _pinger():
 
 @fastapi_app.on_event("startup")
 async def _startup():
+    # Warm up one connection at startup so extensions install early
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(pool, _get_conn)
+        print("[startup] warmup connection ready ✅")
+    except Exception as e:
+        print(f"[startup][warmup error] {e}")
     asyncio.create_task(_pinger())
-    loop = asyncio.get_running_loop()
-    loop.run_in_executor(pool, _warmup)
 
 
 # ── Gradio UI ───────────────────────────────────────────────────────────────
 def _format_result(row: dict) -> str:
     lines = []
-    for field in ["MOBILE NUMBER", "NAME", "FATHER NAME", "ADDRESS", "ALTERNATIVE NUMBER", "AADHAR NUMBER"]:
+    for field in ["MOBILE NUMBER", "NAME", "FATHER NAME", "ADDRESS",
+                  "ALTERNATIVE NUMBER", "AADHAR NUMBER"]:
         val = row.get(field)
         if val:
             lines.append(f"**{field}:** {val}")
@@ -463,12 +521,13 @@ def _search_ui(query: str, limit: int) -> str:
 
 
 def _build_ui():
-    with gr.Blocks(title="Cosmos Search API", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Cosmos Search API") as demo:
         gr.Markdown("# 🔍 ICMR + HITEK Search API")
         gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name & more")
         with gr.Row():
             with gr.Column(scale=3):
-                query_input = gr.Textbox(label="Search Query", placeholder="Phone or Aadhaar...", lines=1)
+                query_input = gr.Textbox(label="Search Query",
+                                         placeholder="Phone or Aadhaar...", lines=1)
             with gr.Column(scale=1):
                 limit_slider = gr.Slider(1, 50, 10, step=1, label="Max Results")
         search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
